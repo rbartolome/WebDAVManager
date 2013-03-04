@@ -1,4 +1,2 @@
-webdavmanager
+WebDAVManager
 =============
-
-WebDAV Manager
