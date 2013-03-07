@@ -195,9 +195,16 @@ static NSInteger successResponseCodeRangeEnds = 299;
     NSDateFormatter *dateFormat = [[NSDateFormatter alloc] init];
     [dateFormat setDateFormat: @"yyyy-MM-dd'T'HH:mm:ss'Z'"];
     NSDate *date = [dateFormat dateFromString: dateString];
+    
     if(!date)
     {
         NSLog(@"Could not parse %@", dateString);
+    }
+    else
+    {
+        NSTimeZone *tz = [NSTimeZone localTimeZone];
+        NSInteger seconds = [tz secondsFromGMTForDate: date];
+        date = [NSDate dateWithTimeInterval: seconds sinceDate: date];
     }
     
     return date;
