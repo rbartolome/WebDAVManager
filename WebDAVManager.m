@@ -17,8 +17,12 @@ NSString *WebDAVURIKey           = @"uri";
 static NSInteger successResponseCodeRangeBegin = 100;
 static NSInteger successResponseCodeRangeEnds = 299;
 
+
 @interface WebDAVManagerRequest : NSObject <NSURLConnectionDelegate, NSURLConnectionDataDelegate, NSXMLParserDelegate>
 
+@property(atomic) BOOL success;
+
+@property (nonatomic, retain) NSError *requestError;
 @property(nonatomic, retain) NSMutableURLRequest *request;
 @property(nonatomic, retain) NSURL *url;
 @property(atomic) WebDAVManagerRequestType type;
@@ -27,6 +31,8 @@ static NSInteger successResponseCodeRangeEnds = 299;
 @property(nonatomic, retain) NSString *password;
 @property(nonatomic, retain) NSMutableData *responseData;
 @property(atomic) NSInteger responseStatusCode;
+
+@property (nonatomic, retain) NSOperationQueue *connectionQueue;
 
 - (void)startRequest;
 
@@ -40,6 +46,8 @@ static NSInteger successResponseCodeRangeEnds = 299;
 
     NSUInteger _parseState;    
     NSUInteger _uriLength;
+    
+    NSURLConnection *_connection;
 }
 
 @synthesize request;
@@ -61,28 +69,51 @@ static NSInteger successResponseCodeRangeEnds = 299;
     _xmlBucket = nil;
     _directoryBucket = nil;
 }
+- (id)init;
+{
+    if((self = [super init]))
+    {
+        [self setConnectionQueue: [[NSOperationQueue alloc] init]];
+    }
+    
+    return self;
+}
 
-- (void)startRequest;
+- (void)_startRequest: (id)sender;
 {
     _directoryBucket = [[NSMutableArray alloc] init];
     [[self request] setCachePolicy: NSURLRequestReloadIgnoringLocalCacheData];
-
+    
     _uriLength = [[[[self url] path] stringByAddingPercentEscapesUsingEncoding:NSUTF8StringEncoding] length] + 1;
     if([NSURLConnection canHandleRequest: [self request]])
     {
-        [NSURLConnection connectionWithRequest: [self request] delegate: self];
+        _connection = [[NSURLConnection alloc] initWithRequest:[self request]
+                                                      delegate: self
+                                              startImmediately: NO];
+        
+        [_connection setDelegateQueue: [self connectionQueue]];
+        
+        [_connection start];
     }
     else
-    {
-        completionBlock([self url], [self type], nil, 0, nil, NO);
+    {        
+        [self setSuccess: NO];
+        [self requestFinished: nil];
     }
+}
+
+- (void)startRequest;
+{
+    [self _startRequest: nil];
 }
 
 #pragma mark - NSURLConnectionDelegate
 
-- (void)connection:(NSURLConnection *)connection didFailWithError:(NSError *)error;
+- (void)connection:(NSURLConnection *)connection didFailWithError: (NSError *)error;
 {
-    completionBlock([self url], [self type], nil, [self responseStatusCode], error, NO);
+    [self setSuccess: NO];
+    [self setRequestError: error];
+    [self requestFinished: nil];
 }
 
 - (void)connection:(NSURLConnection *)connection didReceiveAuthenticationChallenge:(NSURLAuthenticationChallenge *)challenge {
@@ -95,7 +126,12 @@ static NSInteger successResponseCodeRangeEnds = 299;
         
         [[challenge sender] useCredential: cred forAuthenticationChallenge: challenge];
     }
-
+    else
+    {
+        [self setResponseStatusCode: 401];
+        [self setSuccess: NO];
+        [self requestFinished: nil];
+    }
 }
 
 - (BOOL)connection:(NSURLConnection *)connection canAuthenticateAgainstProtectionSpace:(NSURLProtectionSpace *)protectionSpace
@@ -123,7 +159,9 @@ static NSInteger successResponseCodeRangeEnds = 299;
     if(_responseStatusCode >= 400)
     {
         [connection cancel];
-        completionBlock([self url], [self type], nil, [self responseStatusCode], nil, NO);
+        
+        [self setSuccess: NO];
+        [self requestFinished: nil];
     }
 }
 
@@ -140,23 +178,37 @@ static NSInteger successResponseCodeRangeEnds = 299;
 
 -(void)connectionDidFinishLoading:(NSURLConnection *)connection
 {
-    BOOL success = NO;
+    [self setSuccess: NO];
     
     if([self responseStatusCode] >= successResponseCodeRangeBegin && [self responseStatusCode] <= successResponseCodeRangeEnds)
-        success = YES;
+        [self setSuccess: YES];
+    
     
     if([self type] == kWebDAVManagerRequestPROPFIND)
-    {
+    {        
         NSXMLParser *parser = [[NSXMLParser alloc] initWithData: _responseData];
         [parser setDelegate: self];
         [parser parse];
         
-        completionBlock([self url], [self type], _directoryBucket ? @{@"responseData": _directoryBucket} : nil, [self responseStatusCode], nil, success);
+        [self requestFinished: _directoryBucket ? @{@"responseData": _directoryBucket} : nil];
     }
     else
     {
-        completionBlock([self url], [self type], [self responseData] ? @{@"responseData": [self responseData]} : nil, [self responseStatusCode], nil, success);
+        [self requestFinished: [self responseData] ? @{@"responseData": [self responseData]} : nil];
     }
+}
+
+- (void)requestFinished: (id)resultData;
+{
+    dispatch_async(dispatch_get_main_queue(), ^{
+        
+        completionBlock([self url],
+                        [self type],
+                        resultData,
+                        [self responseStatusCode],
+                        [self requestError],
+                        [self success]);
+    });
 }
 
 #pragma mark - NSXML parser
@@ -231,6 +283,7 @@ static NSInteger successResponseCodeRangeEnds = 299;
     return date;
 }
 
+
 - (void)parser: (NSXMLParser *)parser didEndElement: (NSString *)elementName namespaceURI: (NSString *)namespaceURI qualifiedName: (NSString *)qName
 {    
         if([elementName isEqualToString: @"D:href"])
@@ -238,6 +291,7 @@ static NSInteger successResponseCodeRangeEnds = 299;
             if([_xmlChars length] < _uriLength)
             {
                 // whoa, problemo.
+                NSLog(@"PROBLEMO");
                 return;
             }
             
@@ -282,7 +336,7 @@ static NSInteger successResponseCodeRangeEnds = 299;
             }
         }
         else if([elementName hasSuffix: @":getlastmodified"])
-        {          
+        {
             if([_xmlChars length])
             {
                 NSDate *d = [[self class] parseRFCDateString: _xmlChars];
@@ -356,18 +410,16 @@ static NSInteger successResponseCodeRangeEnds = 299;
     [req setTimeoutInterval: 60 * 5];
     [req setHTTPMethod: @"MKCOL"];
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @autoreleasepool {
-            WebDAVManagerRequest *request = [[WebDAVManagerRequest alloc] init];
-            [request setUsername: [self username]];
-            [request setPassword: [self password]];
-            [request setUrl: url];
-            [request setRequest: req];
-            [request setType: kWebDAVManagerRequestMKCOL];
-            [request setCompletionBlock: completion];
-            [request startRequest];
-        }
-    });
+    @autoreleasepool {
+        WebDAVManagerRequest *request = [[WebDAVManagerRequest alloc] init];
+        [request setUsername: [self username]];
+        [request setPassword: [self password]];
+        [request setUrl: url];
+        [request setRequest: req];
+        [request setType: kWebDAVManagerRequestMKCOL];
+        [request setCompletionBlock: completion];
+        [request startRequest];
+    }
 }
 
 - (void)writeData: (NSData *)data toURL: (NSURL *)url completion: (WebDAVManagerCompletionBlock)completion;
@@ -377,21 +429,19 @@ static NSInteger successResponseCodeRangeEnds = 299;
     [req setTimeoutInterval: 60 * 5];
     [req setHTTPMethod: @"PUT"];
     [req setValue: @"application/octet-stream" forHTTPHeaderField: @"Content-Type"];
-    [req setValue: [NSString stringWithFormat: @"%ld", [data length]] forHTTPHeaderField: @"Content-Length"];
+    [req setValue: [NSString stringWithFormat: @"%ld", (unsigned long)[data length]] forHTTPHeaderField: @"Content-Length"];
     [req setHTTPBody: data];
     
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @autoreleasepool {
-            WebDAVManagerRequest *request = [[WebDAVManagerRequest alloc] init];
-            [request setUsername: [self username]];
-            [request setPassword: [self password]];
-            [request setUrl: url];
-            [request setRequest: req];
-            [request setType: kWebDAVManagerRequestPUT];
-            [request setCompletionBlock: completion];
-            [request startRequest];
-        }
-    });
+    @autoreleasepool {
+        WebDAVManagerRequest *request = [[WebDAVManagerRequest alloc] init];
+        [request setUsername: [self username]];
+        [request setPassword: [self password]];
+        [request setUrl: url];
+        [request setRequest: req];
+        [request setType: kWebDAVManagerRequestPUT];
+        [request setCompletionBlock: completion];
+        [request startRequest];
+    }
 }
 
 - (void)dataWithContentsOfURL: (NSURL *)url completion: (WebDAVManagerCompletionBlock)completion;
@@ -401,18 +451,16 @@ static NSInteger successResponseCodeRangeEnds = 299;
     [req setTimeoutInterval: 60 * 5];
     [req setHTTPMethod: @"GET"];
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @autoreleasepool {
-            WebDAVManagerRequest *request = [[WebDAVManagerRequest alloc] init];
-            [request setUsername: [self username]];
-            [request setPassword: [self password]];
-            [request setUrl: url];
-            [request setRequest: req];
-            [request setType: kWebDAVManagerRequestGET];
-            [request setCompletionBlock: completion];
-            [request startRequest];
-        }
-    });
+    @autoreleasepool {
+        WebDAVManagerRequest *request = [[WebDAVManagerRequest alloc] init];
+        [request setUsername: [self username]];
+        [request setPassword: [self password]];
+        [request setUrl: url];
+        [request setRequest: req];
+        [request setType: kWebDAVManagerRequestGET];
+        [request setCompletionBlock: completion];
+        [request startRequest];
+    }
 }
 
 - (void)removeItemAtURL: (NSURL *)url completion: (WebDAVManagerCompletionBlock)completion;
@@ -422,18 +470,16 @@ static NSInteger successResponseCodeRangeEnds = 299;
     [req setTimeoutInterval: 60 * 5];
     [req setHTTPMethod: @"DELETE"];
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @autoreleasepool {
-            WebDAVManagerRequest *request = [[WebDAVManagerRequest alloc] init];
-            [request setUsername: [self username]];
-            [request setPassword: [self password]];
-            [request setUrl: url];
-            [request setRequest: req];
-            [request setType: kWebDAVManagerRequestDELETE];
-            [request setCompletionBlock: completion];
-            [request startRequest];
-        }
-    });
+    @autoreleasepool {
+        WebDAVManagerRequest *request = [[WebDAVManagerRequest alloc] init];
+        [request setUsername: [self username]];
+        [request setPassword: [self password]];
+        [request setUrl: url];
+        [request setRequest: req];
+        [request setType: kWebDAVManagerRequestDELETE];
+        [request setCompletionBlock: completion];
+        [request startRequest];
+    }
 }
 
 - (void)copyItemAtURL: (NSURL *)url toURL: (NSURL *)destination completion: (WebDAVManagerCompletionBlock)completion;
@@ -444,18 +490,16 @@ static NSInteger successResponseCodeRangeEnds = 299;
     [req setHTTPMethod: @"COPY"];
     [req setValue: [destination absoluteString] forHTTPHeaderField: @"Destination"];
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @autoreleasepool {
-            WebDAVManagerRequest *request = [[WebDAVManagerRequest alloc] init];
-            [request setUsername: [self username]];
-            [request setPassword: [self password]];
-            [request setUrl: url];
-            [request setRequest: req];
-            [request setType: kWebDAVManagerRequestCOPY];
-            [request setCompletionBlock: completion];
-            [request startRequest];
-        }
-    });
+    @autoreleasepool {
+        WebDAVManagerRequest *request = [[WebDAVManagerRequest alloc] init];
+        [request setUsername: [self username]];
+        [request setPassword: [self password]];
+        [request setUrl: url];
+        [request setRequest: req];
+        [request setType: kWebDAVManagerRequestCOPY];
+        [request setCompletionBlock: completion];
+        [request startRequest];
+    }
 }
 
 - (void)moveItemAtURL: (NSURL *)url  toURL: (NSURL *)destination completion: (WebDAVManagerCompletionBlock)completion;
@@ -466,18 +510,16 @@ static NSInteger successResponseCodeRangeEnds = 299;
     [req setHTTPMethod: @"MOVE"];
     [req setValue: [destination absoluteString] forHTTPHeaderField: @"Destination"];
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @autoreleasepool {
-            WebDAVManagerRequest *request = [[WebDAVManagerRequest alloc] init];
-            [request setUsername: [self username]];
-            [request setPassword: [self password]];
-            [request setUrl: url];
-            [request setRequest: req];
-            [request setType: kWebDAVManagerRequestMOVE];
-            [request setCompletionBlock: completion];
-            [request startRequest];
-        }
-    });
+    @autoreleasepool {
+        WebDAVManagerRequest *request = [[WebDAVManagerRequest alloc] init];
+        [request setUsername: [self username]];
+        [request setPassword: [self password]];
+        [request setUrl: url];
+        [request setRequest: req];
+        [request setType: kWebDAVManagerRequestMOVE];
+        [request setCompletionBlock: completion];
+        [request startRequest];
+    }
 }
 
 
@@ -506,18 +548,16 @@ static NSInteger successResponseCodeRangeEnds = 299;
     [req setValue: @"application/xml" forHTTPHeaderField: @"Content-Type"];
     [req setHTTPBody: [xml dataUsingEncoding: NSUTF8StringEncoding]];
     
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @autoreleasepool {
-            WebDAVManagerRequest *request = [[WebDAVManagerRequest alloc] init];
-            [request setUsername: [self username]];
-            [request setPassword: [self password]];
-            [request setUrl: url];
-            [request setRequest: req];
-            [request setType: kWebDAVManagerRequestPROPFIND];
-            [request setCompletionBlock: completion];
-            [request startRequest];
-        }
-    });
+    @autoreleasepool {
+        WebDAVManagerRequest *request = [[WebDAVManagerRequest alloc] init];
+        [request setUsername: [self username]];
+        [request setPassword: [self password]];
+        [request setUrl: url];
+        [request setRequest: req];
+        [request setType: kWebDAVManagerRequestPROPFIND];
+        [request setCompletionBlock: completion];
+        [request startRequest];
+    }
 }
 
 + (BOOL)contentTypeIsDirectory: (NSString *)contentType;

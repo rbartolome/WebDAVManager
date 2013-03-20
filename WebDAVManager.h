@@ -19,6 +19,7 @@ typedef enum {
     kWebDAVManagerRequestMOVE
 } WebDAVManagerRequestType;
 
+
 typedef void (^WebDAVManagerCompletionBlock)(NSURL *url, WebDAVManagerRequestType requestType, NSDictionary *userinfo, NSInteger responseStatusCode, NSError *error, BOOL success);
 
 @interface WebDAVManager : NSObject
