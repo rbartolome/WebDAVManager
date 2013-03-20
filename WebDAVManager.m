@@ -191,14 +191,35 @@ static NSInteger successResponseCodeRangeEnds = 299;
 
 + (NSDate *)parseDateString: (NSString *)dateString
 {
-    
     NSDateFormatter *dateFormat = [[NSDateFormatter alloc] init];
     [dateFormat setDateFormat: @"yyyy-MM-dd'T'HH:mm:ss'Z'"];
+    NSDate *date = [dateFormat dateFromString: dateString];
+
+    if(!date)
+    {
+        NSLog(@"Could not parse %@", dateString);
+    }
+    else
+    {
+        NSTimeZone *tz = [NSTimeZone localTimeZone];
+        NSInteger seconds = [tz secondsFromGMTForDate: date];
+        date = [NSDate dateWithTimeInterval: seconds sinceDate: date];
+    }
+    
+    return date;
+}
+
++ (NSDate *)parseRFCDateString: (NSString *)dateString
+{
+    NSDateFormatter *dateFormat = [[NSDateFormatter alloc] init];
+    [dateFormat setDateFormat:@"EEE',' dd MMM yyyy HH':'mm':'ss z"];
+    [dateFormat setTimeZone:[NSTimeZone timeZoneWithAbbreviation: @"GMT"]];
+    dateFormat.locale=[[NSLocale alloc] initWithLocaleIdentifier: @"en_US_POSIX"];
     NSDate *date = [dateFormat dateFromString: dateString];
     
     if(!date)
     {
-        NSLog(@"Could not parse %@", dateString);
+        NSLog(@"Could not parse RFC Date %@", dateString);
     }
     else
     {
@@ -261,7 +282,22 @@ static NSInteger successResponseCodeRangeEnds = 299;
             }
         }
         else if([elementName hasSuffix: @":getlastmodified"])
-        {
+        {          
+            if([_xmlChars length])
+            {
+                NSDate *d = [[self class] parseRFCDateString: _xmlChars];
+                
+                if(d)
+                {
+                    NSInteger colIdx = [elementName rangeOfString: @":"].location;
+                    
+                    [_xmlBucket setObject: d forKey: [elementName substringFromIndex: colIdx + 1]];
+                }
+                else
+                {
+                    NSLog(@"Could not parse RFC date string '%@' for '%@'", _xmlChars, elementName);
+                }
+            }
         }
         else if([elementName hasSuffix: @":getetag"] && [_xmlChars length])
         {
