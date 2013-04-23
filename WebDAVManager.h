@@ -24,6 +24,7 @@ typedef void (^WebDAVManagerCompletionBlock)(NSURL *url, WebDAVManagerRequestTyp
 
 @interface WebDAVManager : NSObject
 
+@property (atomic) NSInteger timeout;
 @property (nonatomic, retain) NSString *username;
 @property (nonatomic, retain) NSString *password;
 @property (nonatomic, retain) NSURL *remoteURL;
@@ -38,5 +39,12 @@ typedef void (^WebDAVManagerCompletionBlock)(NSURL *url, WebDAVManagerRequestTyp
 - (void)moveItemAtURL: (NSURL *)url  toURL: (NSURL *)destination completion: (WebDAVManagerCompletionBlock)completion;
 
 + (BOOL)contentTypeIsDirectory: (NSString *)contentType;
+
+@end
+
+@interface MutableURLRequestQueue : NSObject
+
++ (MutableURLRequestQueue *)sharedQueue;
+- (BOOL)isAvailable;
 
 @end

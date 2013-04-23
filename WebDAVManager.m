@@ -14,11 +14,116 @@ NSString *WebDAVETagKey          = @"etag";
 NSString *WebDAVHREFKey          = @"href";
 NSString *WebDAVURIKey           = @"uri";
 
-static NSInteger successResponseCodeRangeBegin = 100;
-static NSInteger successResponseCodeRangeEnds = 299;
+static NSInteger defaultTimeoutInterval = 60;
 
+@protocol MutableURLRequestQueueItem <NSObject>
 
-@interface WebDAVManagerRequest : NSObject <NSURLConnectionDelegate, NSURLConnectionDataDelegate, NSXMLParserDelegate>
+- (void)startRequestWithQueue: (__weak MutableURLRequestQueue *)queue;
+
+@end
+
+@interface MutableURLRequestQueue ()
+
+@property(atomic) NSInteger slots;
+
+- (void)addItem: (id)item;
+
+@end
+
+@implementation MutableURLRequestQueue
+{
+    NSMutableSet *_items;
+    NSMutableSet *_itemsInProgress;
+    dispatch_queue_t _progressQueue;
+}
+
+- (void)dealloc;
+{
+    _itemsInProgress = nil;
+    _items = nil;
+    _progressQueue = nil;
+}
+
++ (MutableURLRequestQueue *)sharedQueue;
+{
+    static dispatch_once_t onceToken;
+    static MutableURLRequestQueue *_sharedProgressQueue;
+    dispatch_once(&onceToken, ^{
+        _sharedProgressQueue = [[MutableURLRequestQueue alloc] initWithCount: 1];
+    });
+    
+    return _sharedProgressQueue;
+}
+
+- (id)initWithCount: (NSInteger)count;
+{
+    if((self = [super init]))
+    {
+        [self setSlots: count];
+        _items = [[NSMutableSet alloc] init];
+        _itemsInProgress = [[NSMutableSet alloc] init];
+        _progressQueue = dispatch_queue_create("MutableURLRequestQueue.progressQueue", DISPATCH_QUEUE_SERIAL);
+    }
+    
+    return self;
+}
+
+- (BOOL)isAvailable;
+{
+    __block BOOL result = NO;
+    
+    dispatch_sync(_progressQueue, ^{
+        
+        NSInteger globalCount = [_itemsInProgress count] + [_items count];
+        result = globalCount > 0 ? NO : YES;
+        
+    });
+    
+    return result;
+}
+
+- (void)addItem: (id<MutableURLRequestQueueItem>)aItem;
+{
+    dispatch_async(_progressQueue, ^{
+        
+        if([_itemsInProgress count] < _slots)
+        {
+            [_itemsInProgress addObject: aItem];
+            [aItem startRequestWithQueue: self];
+        }
+        else
+        {
+            [_items addObject: aItem];
+        }
+        
+//        NSLog(@"Items %i/%i", [_itemsInProgress count], [_items count]);
+    });
+}
+
+- (void)requestItemDidEndConnection: (id<MutableURLRequestQueueItem>)item;
+{
+    dispatch_async(_progressQueue, ^{
+        [_itemsInProgress removeObject: item];
+        
+        if([_itemsInProgress count] < _slots)
+        {
+            if([_items count] > 0)
+            {
+                id aItem = [[_items allObjects] objectAtIndex: 0];
+                [_itemsInProgress addObject: aItem];
+                [_items removeObject: aItem];
+                
+                [aItem startRequestWithQueue: self];
+            }
+        }
+        
+//        NSLog(@"Items %i/%i", [_itemsInProgress count], [_items count]);
+    });
+}
+
+@end
+
+@interface WebDAVManagerRequest : NSObject <NSURLConnectionDelegate, NSURLConnectionDataDelegate, NSXMLParserDelegate, MutableURLRequestQueueItem>
 
 @property(atomic) BOOL success;
 
@@ -48,6 +153,8 @@ static NSInteger successResponseCodeRangeEnds = 299;
     NSUInteger _uriLength;
     
     NSURLConnection *_connection;
+    
+    __weak MutableURLRequestQueue *_requestQueue;
 }
 
 @synthesize request;
@@ -79,6 +186,12 @@ static NSInteger successResponseCodeRangeEnds = 299;
     return self;
 }
 
+- (void)startRequestWithQueue: (__weak MutableURLRequestQueue *)queue;
+{
+    _requestQueue = queue;
+    [self startRequest];
+}
+
 - (void)_startRequest: (id)sender;
 {
     _directoryBucket = [[NSMutableArray alloc] init];
@@ -92,7 +205,6 @@ static NSInteger successResponseCodeRangeEnds = 299;
                                               startImmediately: NO];
         
         [_connection setDelegateQueue: [self connectionQueue]];
-        
         [_connection start];
     }
     else
@@ -180,7 +292,7 @@ static NSInteger successResponseCodeRangeEnds = 299;
 {
     [self setSuccess: NO];
     
-    if([self responseStatusCode] >= successResponseCodeRangeBegin && [self responseStatusCode] <= successResponseCodeRangeEnds)
+    if([self responseStatusCode] < 300)
         [self setSuccess: YES];
     
     
@@ -201,6 +313,10 @@ static NSInteger successResponseCodeRangeEnds = 299;
 - (void)requestFinished: (id)resultData;
 {
     dispatch_async(dispatch_get_main_queue(), ^{
+        if(_requestQueue)
+        {
+            [_requestQueue requestItemDidEndConnection: self];
+        }
         
         completionBlock([self url],
                         [self type],
@@ -256,6 +372,7 @@ static NSInteger successResponseCodeRangeEnds = 299;
         NSTimeZone *tz = [NSTimeZone localTimeZone];
         NSInteger seconds = [tz secondsFromGMTForDate: date];
         date = [NSDate dateWithTimeInterval: seconds sinceDate: date];
+//        NSLog(@"creation date %@", date);
     }
     
     return date;
@@ -278,6 +395,7 @@ static NSInteger successResponseCodeRangeEnds = 299;
         NSTimeZone *tz = [NSTimeZone localTimeZone];
         NSInteger seconds = [tz secondsFromGMTForDate: date];
         date = [NSDate dateWithTimeInterval: seconds sinceDate: date];
+//        NSLog(@"modif date %@", date);
     }
     
     return date;
@@ -388,7 +506,7 @@ static NSInteger successResponseCodeRangeEnds = 299;
 @implementation WebDAVManager
 {
 }
-
+@synthesize timeout = _timeout;
 @synthesize username = _username;
 @synthesize password = _password;
 @synthesize remoteURL = _remoteURL;
@@ -407,7 +525,7 @@ static NSInteger successResponseCodeRangeEnds = 299;
 {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL: url];
     [req setCachePolicy: NSURLRequestReloadIgnoringLocalCacheData];
-    [req setTimeoutInterval: 60 * 5];
+    [req setTimeoutInterval: _timeout > 0 ? _timeout : defaultTimeoutInterval];
     [req setHTTPMethod: @"MKCOL"];
 
     @autoreleasepool {
@@ -418,7 +536,8 @@ static NSInteger successResponseCodeRangeEnds = 299;
         [request setRequest: req];
         [request setType: kWebDAVManagerRequestMKCOL];
         [request setCompletionBlock: completion];
-        [request startRequest];
+        
+        [[MutableURLRequestQueue sharedQueue] addItem: request];
     }
 }
 
@@ -426,7 +545,7 @@ static NSInteger successResponseCodeRangeEnds = 299;
 {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL: url];
     [req setCachePolicy: NSURLRequestReloadIgnoringLocalCacheData];
-    [req setTimeoutInterval: 60 * 5];
+    [req setTimeoutInterval: _timeout > 0 ? _timeout : defaultTimeoutInterval];
     [req setHTTPMethod: @"PUT"];
     [req setValue: @"application/octet-stream" forHTTPHeaderField: @"Content-Type"];
     [req setValue: [NSString stringWithFormat: @"%ld", (unsigned long)[data length]] forHTTPHeaderField: @"Content-Length"];
@@ -440,7 +559,8 @@ static NSInteger successResponseCodeRangeEnds = 299;
         [request setRequest: req];
         [request setType: kWebDAVManagerRequestPUT];
         [request setCompletionBlock: completion];
-        [request startRequest];
+
+        [[MutableURLRequestQueue sharedQueue] addItem: request];
     }
 }
 
@@ -448,7 +568,7 @@ static NSInteger successResponseCodeRangeEnds = 299;
 {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL: url];
     [req setCachePolicy: NSURLRequestReloadIgnoringLocalCacheData];
-    [req setTimeoutInterval: 60 * 5];
+    [req setTimeoutInterval: _timeout > 0 ? _timeout : defaultTimeoutInterval];
     [req setHTTPMethod: @"GET"];
 
     @autoreleasepool {
@@ -459,7 +579,8 @@ static NSInteger successResponseCodeRangeEnds = 299;
         [request setRequest: req];
         [request setType: kWebDAVManagerRequestGET];
         [request setCompletionBlock: completion];
-        [request startRequest];
+
+        [[MutableURLRequestQueue sharedQueue] addItem: request];
     }
 }
 
@@ -467,7 +588,7 @@ static NSInteger successResponseCodeRangeEnds = 299;
 {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL: url];
     [req setCachePolicy: NSURLRequestReloadIgnoringLocalCacheData];
-    [req setTimeoutInterval: 60 * 5];
+    [req setTimeoutInterval: _timeout > 0 ? _timeout : defaultTimeoutInterval];
     [req setHTTPMethod: @"DELETE"];
 
     @autoreleasepool {
@@ -478,7 +599,8 @@ static NSInteger successResponseCodeRangeEnds = 299;
         [request setRequest: req];
         [request setType: kWebDAVManagerRequestDELETE];
         [request setCompletionBlock: completion];
-        [request startRequest];
+
+        [[MutableURLRequestQueue sharedQueue] addItem: request];
     }
 }
 
@@ -486,7 +608,7 @@ static NSInteger successResponseCodeRangeEnds = 299;
 {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL: url];
     [req setCachePolicy: NSURLRequestReloadIgnoringLocalCacheData];
-    [req setTimeoutInterval: 60 * 5];
+    [req setTimeoutInterval: _timeout > 0 ? _timeout : defaultTimeoutInterval];
     [req setHTTPMethod: @"COPY"];
     [req setValue: [destination absoluteString] forHTTPHeaderField: @"Destination"];
 
@@ -498,7 +620,8 @@ static NSInteger successResponseCodeRangeEnds = 299;
         [request setRequest: req];
         [request setType: kWebDAVManagerRequestCOPY];
         [request setCompletionBlock: completion];
-        [request startRequest];
+
+        [[MutableURLRequestQueue sharedQueue] addItem: request];
     }
 }
 
@@ -506,7 +629,7 @@ static NSInteger successResponseCodeRangeEnds = 299;
 {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL: url];
     [req setCachePolicy: NSURLRequestReloadIgnoringLocalCacheData];
-    [req setTimeoutInterval: 60 * 5];
+    [req setTimeoutInterval: _timeout > 0 ? _timeout : defaultTimeoutInterval];
     [req setHTTPMethod: @"MOVE"];
     [req setValue: [destination absoluteString] forHTTPHeaderField: @"Destination"];
 
@@ -518,7 +641,8 @@ static NSInteger successResponseCodeRangeEnds = 299;
         [request setRequest: req];
         [request setType: kWebDAVManagerRequestMOVE];
         [request setCompletionBlock: completion];
-        [request startRequest];
+
+        [[MutableURLRequestQueue sharedQueue] addItem: request];
     }
 }
 
@@ -530,19 +654,20 @@ static NSInteger successResponseCodeRangeEnds = 299;
 
 - (void)PROPFIND: (NSURL *)url extras: (NSString *)extra completion: (WebDAVManagerCompletionBlock)completion;
 {
-    if (!extra)
+    NSString *localExtra = @"";
+    if (extra)
     {
-        extra = @"";
+        localExtra = extra;
     }
     
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL: url];
     
     [req setCachePolicy: NSURLRequestReloadIgnoringLocalCacheData];
-    [req setTimeoutInterval: 60 * 5];
+    [req setTimeoutInterval: _timeout > 0 ? _timeout : defaultTimeoutInterval];
     
     [req setHTTPMethod: @"PROPFIND"];
     
-    NSString *xml = [NSString stringWithFormat: @"<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n<D:propfind xmlns:D=\"DAV:\"><D:allprop/>%@</D:propfind>", extra];
+    NSString *xml = [NSString stringWithFormat: @"<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n<D:propfind xmlns:D=\"DAV:\"><D:allprop/>%@</D:propfind>", localExtra];
     
     [req setValue: @"1" forHTTPHeaderField: @"Depth"];
     [req setValue: @"application/xml" forHTTPHeaderField: @"Content-Type"];
@@ -556,7 +681,8 @@ static NSInteger successResponseCodeRangeEnds = 299;
         [request setRequest: req];
         [request setType: kWebDAVManagerRequestPROPFIND];
         [request setCompletionBlock: completion];
-        [request startRequest];
+
+        [[MutableURLRequestQueue sharedQueue] addItem: request];
     }
 }
 
